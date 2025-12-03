@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import TYPE_CHECKING, Iterator, cast
 
 from pptx.dml.fill import FillFormat
@@ -9,6 +10,7 @@ from pptx.enum.dml import MSO_FILL
 from pptx.enum.lang import MSO_LANGUAGE_ID
 from pptx.enum.text import MSO_AUTO_SIZE, MSO_UNDERLINE, MSO_VERTICAL_ANCHOR
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+from pptx.oxml.ns import qn
 from pptx.oxml.simpletypes import ST_TextWrappingType
 from pptx.shapes import Subshape
 from pptx.text.fonts import FontFiles
@@ -16,6 +18,8 @@ from pptx.text.layout import TextFitter
 from pptx.util import Centipoints, Emu, Length, Pt, lazyproperty
 
 if TYPE_CHECKING:
+    from lxml import etree as lxml_etree
+
     from pptx.dml.color import ColorFormat
     from pptx.enum.text import (
         MSO_TEXT_UNDERLINE_TYPE,
@@ -679,3 +683,71 @@ class _Run(Subshape):
     @text.setter
     def text(self, text: str):
         self._r.text = text
+
+
+def set_text_preserve_formatting(paragraph: _Paragraph | CT_TextParagraph, text: str) -> None:
+    """Set paragraph text while preserving all formatting and properties.
+
+    This utility function preserves:
+    - Run properties (color, font, size, bold, italic, etc.) from first run or endParaRPr
+    - Paragraph properties (indentation level, bullet points, alignment, spacing, etc.)
+    - End paragraph run properties (endParaRPr) for proper formatting inheritance
+
+    Used by SmartArt and can be used by other components that need formatting preservation.
+
+    Args:
+        paragraph: Either a _Paragraph object or a CT_TextParagraph element (a:p)
+        text: The new text content
+
+    Example:
+        >>> from pptx.text.text import set_text_preserve_formatting
+        >>> para = shape.text_frame.paragraphs[0]
+        >>> set_text_preserve_formatting(para, "New text")
+        # All formatting, indentation, and bullets preserved!
+    """
+    # Handle both _Paragraph objects and raw CT_TextParagraph elements
+    p_elem = paragraph._p if isinstance(paragraph, _Paragraph) else paragraph  # pyright: ignore[reportPrivateUsage]
+
+    # Preserve endParaRPr (default run properties for paragraph)
+    endParaRPr = p_elem.endParaRPr
+    if endParaRPr is not None:
+        endParaRPr = deepcopy(endParaRPr)
+
+    # Find the first text run's properties (a:rPr) for text formatting
+    existing_rPr = None
+    if p_elem.r_lst:
+        existing_rPr = p_elem.r_lst[0].rPr
+
+    # If no run properties found, use endParaRPr as template
+    use_endParaRPr_as_template = False
+    if existing_rPr is None and endParaRPr is not None:
+        existing_rPr = endParaRPr
+        use_endParaRPr_as_template = True
+
+    # Remove only content elements (runs, breaks, fields, endParaRPr)
+    # Keep a:pPr (paragraph properties) intact!
+    for elm in p_elem.content_children:
+        p_elem.remove(elm)
+    # Also remove endParaRPr if present (we'll re-add it at the end)
+    if p_elem.endParaRPr is not None:
+        p_elem.remove(p_elem.endParaRPr)
+
+    # Create new text run with preserved formatting
+    new_run = p_elem.add_r()
+
+    if existing_rPr is not None:
+        # Deep copy the run properties to preserve formatting
+        rPr_copy = deepcopy(existing_rPr)
+        if use_endParaRPr_as_template:
+            # Rename endParaRPr to a:rPr for use in run
+            # Have to use lxml's Element.tag attribute directly
+            cast("lxml_etree._Element", rPr_copy).tag = qn("a:rPr")  # pyright: ignore
+        # Insert rPr before the text element (new_run is an lxml Element)
+        cast("lxml_etree._Element", new_run).insert(0, rPr_copy)  # pyright: ignore
+
+    # Set the text content
+    new_run.text = text
+
+    # Re-add endParaRPr at the end (required for proper formatting inheritance)
+    if endParaRPr is not None:
+        p_elem.append(endParaRPr)
