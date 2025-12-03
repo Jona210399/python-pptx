@@ -685,69 +685,119 @@ class _Run(Subshape):
         self._r.text = text
 
 
+def _as_ct_paragraph(paragraph: _Paragraph | CT_TextParagraph) -> CT_TextParagraph:
+    """Return CT_TextParagraph from either _Paragraph or CT_TextParagraph input."""
+    return paragraph._p if isinstance(paragraph, _Paragraph) else paragraph  # pyright: ignore[reportPrivateUsage]
+
+
+def _extract_run_properties(p: CT_TextParagraph) -> tuple[CT_TextCharacterProperties | None, bool]:
+    """Return (rPr_or_endParaRPr, used_endParaRPr_template_flag)."""
+    endParaRPr = p.endParaRPr
+    rPr = None
+    if p.r_lst:
+        rPr = p.r_lst[0].rPr
+    use_endPara = False
+    if rPr is None and endParaRPr is not None:
+        rPr = endParaRPr
+        use_endPara = True
+    return rPr, use_endPara
+
+
+def _clear_content_keep_properties(p: CT_TextParagraph) -> CT_TextParagraph:
+    """Remove runs/breaks/fields/endParaRPr while keeping paragraph properties (pPr)."""
+    for elm in p.content_children:
+        p.remove(elm)
+    if p.endParaRPr is not None:
+        p.remove(p.endParaRPr)
+    return p
+
+
+def _apply_run_properties(
+    run: CT_RegularTextRun,
+    rPr_template: CT_TextCharacterProperties | None,
+    used_end_para: bool,
+) -> None:
+    """Apply a deep-copied rPr to run; convert endParaRPr to rPr when used as template."""
+    if rPr_template is None:
+        return
+    rPr_copy = deepcopy(rPr_template)
+    if used_end_para:
+        # Rename endParaRPr to a:rPr for use in run
+        cast("lxml_etree._Element", rPr_copy).tag = qn("a:rPr")  # pyright: ignore
+    # Insert rPr before <a:t>
+    cast("lxml_etree._Element", run).insert(0, rPr_copy)  # pyright: ignore
+
+
 def set_text_preserve_formatting(paragraph: _Paragraph | CT_TextParagraph, text: str) -> None:
     """Set paragraph text while preserving all formatting and properties.
 
-    This utility function preserves:
-    - Run properties (color, font, size, bold, italic, etc.) from first run or endParaRPr
-    - Paragraph properties (indentation level, bullet points, alignment, spacing, etc.)
-    - End paragraph run properties (endParaRPr) for proper formatting inheritance
-
-    Used by SmartArt and can be used by other components that need formatting preservation.
-
-    Args:
-        paragraph: Either a _Paragraph object or a CT_TextParagraph element (a:p)
-        text: The new text content
-
-    Example:
-        >>> from pptx.text.text import set_text_preserve_formatting
-        >>> para = shape.text_frame.paragraphs[0]
-        >>> set_text_preserve_formatting(para, "New text")
-        # All formatting, indentation, and bullets preserved!
+    Preserves run properties (color, font, size, bold, italic, etc.), paragraph
+    properties (indentation level, bullets, alignment, spacing, etc.), and
+    end-paragraph properties (endParaRPr) for proper inheritance.
     """
-    # Handle both _Paragraph objects and raw CT_TextParagraph elements
-    p_elem = paragraph._p if isinstance(paragraph, _Paragraph) else paragraph  # pyright: ignore[reportPrivateUsage]
-
-    # Preserve endParaRPr (default run properties for paragraph)
-    endParaRPr = p_elem.endParaRPr
+    p = _as_ct_paragraph(paragraph)
+    endParaRPr = p.endParaRPr
     if endParaRPr is not None:
         endParaRPr = deepcopy(endParaRPr)
 
-    # Find the first text run's properties (a:rPr) for text formatting
-    existing_rPr = None
-    if p_elem.r_lst:
-        existing_rPr = p_elem.r_lst[0].rPr
+    rPr_template, used_end_para = _extract_run_properties(p)
+    _clear_content_keep_properties(p)
 
-    # If no run properties found, use endParaRPr as template
-    use_endParaRPr_as_template = False
-    if existing_rPr is None and endParaRPr is not None:
-        existing_rPr = endParaRPr
-        use_endParaRPr_as_template = True
-
-    # Remove only content elements (runs, breaks, fields, endParaRPr)
-    # Keep a:pPr (paragraph properties) intact!
-    for elm in p_elem.content_children:
-        p_elem.remove(elm)
-    # Also remove endParaRPr if present (we'll re-add it at the end)
-    if p_elem.endParaRPr is not None:
-        p_elem.remove(p_elem.endParaRPr)
-
-    # Create new text run with preserved formatting
-    new_run = p_elem.add_r()
-
-    if existing_rPr is not None:
-        # Deep copy the run properties to preserve formatting
-        rPr_copy = deepcopy(existing_rPr)
-        if use_endParaRPr_as_template:
-            # Rename endParaRPr to a:rPr for use in run
-            # Have to use lxml's Element.tag attribute directly
-            cast("lxml_etree._Element", rPr_copy).tag = qn("a:rPr")  # pyright: ignore
-        # Insert rPr before the text element (new_run is an lxml Element)
-        cast("lxml_etree._Element", new_run).insert(0, rPr_copy)  # pyright: ignore
-
-    # Set the text content
+    new_run = p.add_r()
+    _apply_run_properties(new_run, rPr_template, used_end_para)
     new_run.text = text
 
-    # Re-add endParaRPr at the end (required for proper formatting inheritance)
     if endParaRPr is not None:
-        p_elem.append(endParaRPr)
+        p.append(endParaRPr)
+
+
+def clone_paragraph_properties(
+    src: _Paragraph | CT_TextParagraph, dst: _Paragraph | CT_TextParagraph
+) -> None:
+    """Copy paragraph-level properties from src to dst.
+
+    Copies `a:pPr` (including indentation level, bullets, alignment, spacing)
+    and `a:endParaRPr` to the destination paragraph. Content (runs/breaks/fields)
+    of destination is left untouched.
+    """
+    s = _as_ct_paragraph(src)
+    d = _as_ct_paragraph(dst)
+
+    # Copy paragraph properties a:pPr
+    if s.pPr is not None:
+        # Remove existing dst pPr first to avoid duplicates
+        if d.pPr is not None:
+            d.remove(d.pPr)
+        # Insert pPr at start using lxml insert
+        cast("lxml_etree._Element", d).insert(0, deepcopy(s.pPr))  # pyright: ignore
+
+    # Copy endParaRPr
+    if s.endParaRPr is not None:
+        if d.endParaRPr is not None:
+            d.remove(d.endParaRPr)
+        d.append(deepcopy(s.endParaRPr))
+
+
+def extract_run_properties(
+    paragraph: _Paragraph | CT_TextParagraph,
+) -> tuple[CT_TextCharacterProperties | None, bool]:
+    """Return (rPr_or_endParaRPr, used_endParaRPr_template_flag) for paragraph.
+
+    Useful when cloning styles to a new paragraph and wanting to apply the
+    same run formatting to the first run.
+    """
+    p = _as_ct_paragraph(paragraph)
+    return _extract_run_properties(p)
+
+
+def apply_run_properties(
+    run: _Run | CT_RegularTextRun,
+    rPr_template: CT_TextCharacterProperties | None,
+    used_end_para: bool,
+) -> None:
+    """Apply a run-properties template to a run.
+
+    Accepts either a public `_Run` or the underlying `CT_RegularTextRun`.
+    """
+    r = run._r if isinstance(run, _Run) else run  # pyright: ignore[reportPrivateUsage]
+    _apply_run_properties(r, rPr_template, used_end_para)
