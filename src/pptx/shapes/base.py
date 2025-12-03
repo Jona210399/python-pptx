@@ -77,6 +77,17 @@ class BaseShape(object):
         return False
 
     @property
+    def has_smartart(self) -> bool:
+        """|True| if this shape is a graphic frame containing a SmartArt diagram.
+
+        |False| otherwise. When |True|, the SmartArt object can be accessed using the
+        ``.smartart`` property.
+        """
+        # This implementation is unconditionally False, the True version is
+        # on GraphicFrame subclass.
+        return False
+
+    @property
     def has_table(self) -> bool:
         """|True| if this shape is a graphic frame containing a table object.
 

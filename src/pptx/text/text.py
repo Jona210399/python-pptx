@@ -15,7 +15,157 @@ from pptx.text.fonts import FontFiles
 from pptx.text.layout import TextFitter
 from pptx.util import Centipoints, Emu, Length, Pt, lazyproperty
 
+
+def get_effective_font_property(paragraph, run_font, property_name: str):
+    """Get the effective value of a font property by traversing the style hierarchy.
+
+    Traverses the PowerPoint style hierarchy to find the effective value of a font property:
+    1. Run's font properties (a:r/a:rPr)
+    2. Paragraph's default run properties (a:p/a:pPr/a:defRPr)
+    3. Slide layout's text styles (if accessible)
+    4. Slide master's text styles (if accessible)
+    5. Returns None if not found (caller should apply PowerPoint application defaults)
+
+    Args:
+        paragraph: The _Paragraph object containing the run
+        run_font: The Font object from the run
+        property_name: Name of the property ('name', 'size', 'bold', 'italic')
+
+    Returns:
+        The effective value of the property, or None if not found in hierarchy.
+
+    Example:
+        >>> paragraph = shape.text_frame.paragraphs[0]
+        >>> run = paragraph.runs[0]
+        >>> font_name = get_effective_font_property(paragraph, run.font, 'name')
+        >>> font_size = get_effective_font_property(paragraph, run.font, 'size')
+        >>> # Apply default if None
+        >>> actual_name = font_name or 'Calibri'
+        >>> actual_size = font_size or Pt(11)
+    """
+    # 1. Try to get the value directly from the run's font
+    direct_value = getattr(run_font, property_name)
+    if direct_value is not None:
+        return direct_value
+
+    # 2. Try to get from paragraph's default run properties (defRPr)
+    if hasattr(paragraph, '_element') or hasattr(paragraph, '_p'):
+        p_element = getattr(paragraph, '_element', None) or getattr(paragraph, '_p', None)
+        if p_element is not None:
+            pPr = p_element.pPr
+            if pPr is not None:
+                defRPr = pPr.defRPr
+                if defRPr is not None:
+                    para_font = Font(defRPr)
+                    para_value = getattr(para_font, property_name)
+                    if para_value is not None:
+                        return para_value
+
+    # 3. Traverse up to slide layout and slide master to find placeholder inheritance
+    # Navigate: paragraph → text_frame → shape → check if placeholder → inherit from layout/master
+    try:
+        if hasattr(paragraph, '_parent'):
+            text_frame = paragraph._parent
+            
+            # Get the shape containing this text frame
+            if hasattr(text_frame, '_parent'):
+                shape = text_frame._parent
+                
+                # Check if this shape is a placeholder that inherits properties
+                if hasattr(shape, 'is_placeholder') and shape.is_placeholder:
+                    # Try to get the base placeholder from the layout
+                    if hasattr(shape, '_base_placeholder'):
+                        base_placeholder = shape._base_placeholder
+                        if base_placeholder is not None and hasattr(base_placeholder, 'text_frame'):
+                            # Get the text frame from the layout placeholder
+                            base_text_frame = base_placeholder.text_frame
+                            if base_text_frame and hasattr(base_text_frame, 'paragraphs'):
+                                # Get the first paragraph from the layout placeholder
+                                base_paragraphs = base_text_frame.paragraphs
+                                if base_paragraphs:
+                                    base_para = base_paragraphs[0]
+                                    # Check paragraph default properties on layout placeholder
+                                    if hasattr(base_para, '_element') or hasattr(base_para, '_p'):
+                                        base_p_element = getattr(base_para, '_element', None) or getattr(base_para, '_p', None)
+                                        if base_p_element is not None:
+                                            base_pPr = base_p_element.pPr
+                                            if base_pPr is not None:
+                                                base_defRPr = base_pPr.defRPr
+                                                if base_defRPr is not None:
+                                                    base_font = Font(base_defRPr)
+                                                    base_value = getattr(base_font, property_name)
+                                                    if base_value is not None:
+                                                        return base_value
+                                
+                                # If still not found, check the master placeholder
+                                if hasattr(base_placeholder, '_base_placeholder'):
+                                    master_placeholder = base_placeholder._base_placeholder
+                                    if master_placeholder is not None and hasattr(master_placeholder, 'text_frame'):
+                                        master_text_frame = master_placeholder.text_frame
+                                        if master_text_frame and hasattr(master_text_frame, 'paragraphs'):
+                                            master_paragraphs = master_text_frame.paragraphs
+                                            if master_paragraphs:
+                                                master_para = master_paragraphs[0]
+                                                if hasattr(master_para, '_element') or hasattr(master_para, '_p'):
+                                                    master_p_element = getattr(master_para, '_element', None) or getattr(master_para, '_p', None)
+                                                    if master_p_element is not None:
+                                                        master_pPr = master_p_element.pPr
+                                                        if master_pPr is not None:
+                                                            master_defRPr = master_pPr.defRPr
+                                                            if master_defRPr is not None:
+                                                                master_font = Font(master_defRPr)
+                                                                master_value = getattr(master_font, property_name)
+                                                                if master_value is not None:
+                                                                    return master_value
+    except (AttributeError, TypeError):
+        # If any part of the traversal fails, just continue to return None
+        pass
+
+    # 4. Property not found in accessible hierarchy
+    # Caller should apply PowerPoint application defaults (typically Calibri 11pt)
+    return None
+
+
+def get_effective_font_with_defaults(paragraph, run_font):
+    """Get all font properties with PowerPoint application defaults applied.
+    
+    This is a convenience function that returns a dictionary with all common font
+    properties, applying PowerPoint's default values when properties are not set
+    anywhere in the hierarchy.
+    
+    Args:
+        paragraph: The _Paragraph object containing the run
+        run_font: The Font object from the run
+        
+    Returns:
+        Dictionary with keys: 'name', 'size', 'size_pt', 'bold', 'italic'
+        All values are guaranteed to be non-None.
+        
+    Example:
+        >>> paragraph = shape.text_frame.paragraphs[0]
+        >>> run = paragraph.runs[0]
+        >>> props = get_effective_font_with_defaults(paragraph, run.font)
+        >>> print(f"Font: {props['name']} {props['size_pt']}pt")
+        >>> if props['bold']:
+        >>>     print("Bold text")
+    """
+    name = get_effective_font_property(paragraph, run_font, 'name') or 'Calibri'
+    size = get_effective_font_property(paragraph, run_font, 'size')
+    size_pt = size.pt if size else 11.0
+    bold = get_effective_font_property(paragraph, run_font, 'bold') or False
+    italic = get_effective_font_property(paragraph, run_font, 'italic') or False
+    
+    return {
+        'name': name,
+        'size': size if size else Pt(11),
+        'size_pt': size_pt,
+        'bold': bold,
+        'italic': italic,
+    }
+
+
 if TYPE_CHECKING:
+    from pptx.oxml.text import CT_TextParagraph
     from pptx.dml.color import ColorFormat
     from pptx.enum.text import (
         MSO_TEXT_UNDERLINE_TYPE,

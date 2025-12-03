@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, cast
 
 from pptx.oxml import parse_xml
 from pptx.oxml.chart.chart import CT_Chart
-from pptx.oxml.ns import nsdecls
+from pptx.oxml.ns import nsdecls, qn
 from pptx.oxml.shapes.shared import BaseShapeElement
 from pptx.oxml.simpletypes import XsdBoolean, XsdString
 from pptx.oxml.table import CT_Table
@@ -19,6 +19,7 @@ from pptx.oxml.xmlchemy import (
 )
 from pptx.spec import (
     GRAPHIC_DATA_URI_CHART,
+    GRAPHIC_DATA_URI_DIAGRAM,
     GRAPHIC_DATA_URI_OLEOBJ,
     GRAPHIC_DATA_URI_TABLE,
 )
@@ -145,6 +146,20 @@ class CT_GraphicalObjectFrame(BaseShapeElement):
         if chart is None:
             return None
         return chart.rId
+
+    @property
+    def diagram_rId(self) -> str | None:
+        """The `rId` attribute of the diagram data relationship.
+
+        |None| if not present or if this is not a diagram.
+        """
+        if self.graphicData_uri != GRAPHIC_DATA_URI_DIAGRAM:
+            return None
+        # Diagram data is referenced via r:id attribute
+        relElem = self.graphicData.find(qn("dgm:relIds"))
+        if relElem is not None:
+            return relElem.get(qn("r:dm"))
+        return None
 
     def get_or_add_xfrm(self) -> CT_Transform2D:
         """Return the required `p:xfrm` child element.

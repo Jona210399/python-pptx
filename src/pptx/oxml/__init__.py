@@ -484,3 +484,10 @@ register_element_cls("p:txBody", CT_TextBody)
 from pptx.oxml.theme import CT_OfficeStyleSheet  # noqa: E402
 
 register_element_cls("a:theme", CT_OfficeStyleSheet)
+
+
+from pptx.oxml.diagram import CT_DataModel, CT_Pt, CT_PtList  # noqa: E402
+
+register_element_cls("dgm:dataModel", CT_DataModel)
+register_element_cls("dgm:ptLst", CT_PtList)
+register_element_cls("dgm:pt", CT_Pt)

@@ -13,6 +13,7 @@ from pptx.shapes.base import BaseShape
 from pptx.shared import ParentedElementProxy
 from pptx.spec import (
     GRAPHIC_DATA_URI_CHART,
+    GRAPHIC_DATA_URI_DIAGRAM,
     GRAPHIC_DATA_URI_OLEOBJ,
     GRAPHIC_DATA_URI_TABLE,
 )
@@ -21,9 +22,11 @@ from pptx.util import lazyproperty
 
 if TYPE_CHECKING:
     from pptx.chart.chart import Chart
+    from pptx.diagram import SmartArt
     from pptx.dml.effect import ShadowFormat
     from pptx.oxml.shapes.graphfrm import CT_GraphicalObjectData, CT_GraphicalObjectFrame
     from pptx.parts.chart import ChartPart
+    from pptx.parts.diagram import DiagramDataPart
     from pptx.parts.slide import BaseSlidePart
     from pptx.types import ProvidesPart
 
@@ -65,6 +68,14 @@ class GraphicFrame(BaseShape):
         return self._graphicFrame.graphicData_uri == GRAPHIC_DATA_URI_CHART
 
     @property
+    def has_smartart(self) -> bool:
+        """|True| if this graphic frame contains a SmartArt diagram. |False| otherwise.
+
+        When |True|, the SmartArt object can be accessed using the `.smartart` property.
+        """
+        return self._graphicFrame.graphicData_uri == GRAPHIC_DATA_URI_DIAGRAM
+
+    @property
     def has_table(self) -> bool:
         """|True| if this graphic frame contains a table object, |False| otherwise.
 
@@ -99,14 +110,16 @@ class GraphicFrame(BaseShape):
         """Optional member of `MSO_SHAPE_TYPE` identifying the type of this shape.
 
         Possible values are `MSO_SHAPE_TYPE.CHART`, `MSO_SHAPE_TYPE.TABLE`,
-        `MSO_SHAPE_TYPE.EMBEDDED_OLE_OBJECT`, `MSO_SHAPE_TYPE.LINKED_OLE_OBJECT`.
+        `MSO_SHAPE_TYPE.IGX_GRAPHIC` (SmartArt), `MSO_SHAPE_TYPE.EMBEDDED_OLE_OBJECT`,
+        `MSO_SHAPE_TYPE.LINKED_OLE_OBJECT`.
 
-        This value is `None` when none of these four types apply, for example when the shape
-        contains SmartArt.
+        This value is `None` when none of these types apply.
         """
         graphicData_uri = self._graphicFrame.graphicData_uri
         if graphicData_uri == GRAPHIC_DATA_URI_CHART:
             return MSO_SHAPE_TYPE.CHART
+        elif graphicData_uri == GRAPHIC_DATA_URI_DIAGRAM:
+            return MSO_SHAPE_TYPE.IGX_GRAPHIC
         elif graphicData_uri == GRAPHIC_DATA_URI_TABLE:
             return MSO_SHAPE_TYPE.TABLE
         elif graphicData_uri == GRAPHIC_DATA_URI_OLEOBJ:
@@ -117,6 +130,24 @@ class GraphicFrame(BaseShape):
             )
         else:
             return None  # pyright: ignore[reportReturnType]
+
+    @property
+    def smartart(self) -> SmartArt:
+        """The |SmartArt| object containing the SmartArt diagram in this graphic frame.
+
+        Raises |ValueError| if this graphic frame does not contain a SmartArt diagram.
+        """
+        if not self.has_smartart:
+            raise ValueError("shape does not contain a SmartArt diagram")
+        return self.smartart_part.smartart
+
+    @property
+    def smartart_part(self) -> DiagramDataPart:
+        """The |DiagramDataPart| object containing the SmartArt data."""
+        diagram_rId = self._graphicFrame.diagram_rId
+        if diagram_rId is None:
+            raise ValueError("this graphic frame does not contain a SmartArt diagram")
+        return cast("DiagramDataPart", self.part.related_part(diagram_rId))
 
     @property
     def table(self) -> Table:
