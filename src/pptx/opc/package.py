@@ -391,13 +391,16 @@ class XmlPart(Part):
     ):
         super(XmlPart, self).__init__(partname, content_type, package)
         self._element = element
+        self._original_blob: bytes | None = None  # Store original bytes for format preservation
 
     @classmethod
     def load(cls, partname: PackURI, content_type: str, package: Package, blob: bytes):
         """Return instance of `cls` loaded with parsed XML from `blob`."""
-        return cls(
+        instance = cls(
             partname, content_type, package, element=cast("BaseOxmlElement", parse_xml(blob))
         )
+        instance._original_blob = blob  # Store original for format preservation
+        return instance
 
     @property
     def blob(self) -> bytes:  # pyright: ignore[reportIncompatibleMethodOverride]
@@ -727,8 +730,7 @@ class _Relationship:
         """|Part| or subtype referred to by this relationship."""
         if self.is_external:
             raise ValueError(
-                "`.target_part` property on _Relationship is undefined when "
-                "target-mode is external"
+                "`.target_part` property on _Relationship is undefined when target-mode is external"
             )
         assert isinstance(self._target, Part)
         return self._target

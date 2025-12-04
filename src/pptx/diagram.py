@@ -37,6 +37,272 @@ class SmartArtNodeFactory:
         self._create_transition_nodes(ptLst, par_trans_id, sib_trans_id, cxn_id)
         return pt
 
+    def create_presentation_nodes(
+        self, ptLst: CT_PtList, data_node_id: str, template_data_node_id: str | None = None
+    ) -> None:
+        """Create presentation nodes for a data node.
+
+        Copies the presentation node structure from an existing template node.
+        If no template is provided, no presentation nodes are created (allows
+        SmartArt diagrams without presentation nodes to work correctly).
+
+        Args:
+            ptLst: The point list to add nodes to
+            data_node_id: The model ID of the data node to create pres nodes for
+            template_data_node_id: Optional model ID of an existing data node to
+                                  copy presentation node structure from
+        """
+        import uuid
+
+        # Find template presentation nodes if provided
+        template_pres_nodes = []
+        if template_data_node_id:
+            for pt in ptLst.findall(qn("dgm:pt")):
+                if pt.get("type") == "pres":
+                    prSet = pt.find(qn("dgm:prSet"))
+                    if prSet is not None and prSet.get("presAssocID") == template_data_node_id:
+                        template_pres_nodes.append(pt)
+
+        # If no template nodes found, don't create presentation nodes
+        # This allows SmartArt without presentation nodes to work
+        if not template_pres_nodes:
+            return
+
+        # Sort by presName to ensure consistent order
+        template_pres_nodes.sort(key=lambda pt: pt.find(qn("dgm:prSet")).get("presName", ""))
+
+        # Count existing editable nodes (excluding the one we're creating for)
+        # This determines presStyleIdx for the new nodes
+        editable_node_count = 0
+        for pt in ptLst.findall(qn("dgm:pt")):
+            pt_type = pt.get("type")
+            if (
+                pt_type not in ("pres", "parTrans", "sibTrans", "doc")
+                and pt.get("modelId") != data_node_id
+            ):
+                editable_node_count += 1
+
+        # presStyleCnt is the total count including the new node
+        pres_style_cnt = editable_node_count + 1
+        # presStyleIdx is 0-based, so it's the count of existing nodes
+        pres_style_idx = editable_node_count
+
+        # Create presentation nodes by copying from template
+        created_pres_ids = []
+        textRect_pres_id = None  # Track textRect for presOf connection
+
+        for template_pt in template_pres_nodes:
+            # Generate unique ID for this pres node
+            pres_id = "{" + str(uuid.uuid4()).upper() + "}"
+            created_pres_ids.append(pres_id)
+
+            # Create the presentation node
+            pres_pt = ptLst.add_pt(pres_id, "pres")
+            pres_prSet = etree.SubElement(pres_pt, qn("dgm:prSet"))  # pyright: ignore[reportUnknownMemberType]
+
+            # Set presAssocID to link to new data node
+            pres_prSet.set("presAssocID", data_node_id)
+
+            # Copy all attributes from template except presAssocID, presStyleIdx, presStyleCnt
+            template_prSet = template_pt.find(qn("dgm:prSet"))
+            pres_name = None
+            if template_prSet is not None:
+                for attr_name, attr_value in template_prSet.attrib.items():
+                    clean_name = attr_name.split("}")[-1] if "}" in attr_name else attr_name
+                    # Skip presAssocID, presStyleIdx, presStyleCnt as we'll set them explicitly
+                    if clean_name not in ("presAssocID", "presStyleIdx", "presStyleCnt"):
+                        pres_prSet.set(clean_name, attr_value)
+                    if clean_name == "presName":
+                        pres_name = attr_value
+
+                # Set presStyleIdx and presStyleCnt with calculated values
+                # Special handling: compNode keeps presStyleCnt from template (usually "0")
+                # Other nodes (pictRect, textRect) use the incremented count
+                template_pres_style_cnt = template_prSet.get("presStyleCnt")
+                if template_pres_style_cnt is not None:
+                    if pres_name == "compNode":
+                        # compNode keeps its original presStyleCnt (usually "0")
+                        pres_prSet.set("presStyleCnt", template_pres_style_cnt)
+                    else:
+                        # Other nodes use the calculated presStyleCnt
+                        pres_prSet.set("presStyleCnt", str(pres_style_cnt))
+
+                # presStyleIdx is always calculated (for nodes that have it)
+                if template_prSet.get("presStyleIdx") is not None:
+                    pres_prSet.set("presStyleIdx", str(pres_style_idx))
+
+                # Track textRect for presOf connection
+                if pres_name == "textRect":
+                    textRect_pres_id = pres_id
+
+                # Copy child elements deeply
+                from copy import deepcopy
+
+                for child in template_prSet:
+                    pres_prSet.append(deepcopy(child))
+
+            # Copy spPr element structure from template
+            template_spPr = template_pt.find(qn("dgm:spPr"))
+            if template_spPr is not None:
+                from copy import deepcopy
+
+                pres_pt.append(deepcopy(template_spPr))
+            else:
+                # Add empty spPr if template doesn't have one
+                etree.SubElement(pres_pt, qn("dgm:spPr"))  # pyright: ignore[reportUnknownMemberType]
+
+        # Create presentation connections by copying from template
+        self._create_presentation_connections_from_template(
+            created_pres_ids, data_node_id, template_pres_nodes
+        )
+
+        # Create presOf connection from data node to textRect
+        if textRect_pres_id:
+            self._create_presof_connection(data_node_id, textRect_pres_id)
+
+    def _create_presentation_connections_from_template(
+        self, pres_ids: list[str], data_node_id: str, template_pres_nodes: list
+    ) -> None:
+        """Create connections for presentation nodes by copying template pattern.
+
+        Finds all connections involving the template nodes and creates
+        equivalent connections for the new nodes. Does NOT create presOf connections
+        as those are handled separately.
+        """
+        if not template_pres_nodes or len(pres_ids) != len(template_pres_nodes):
+            return
+
+        cxnLst_elem = self._data_model.find(qn("dgm:cxnLst"))
+        if cxnLst_elem is None:
+            return
+
+        # Get template node IDs
+        template_node_ids = [pt.get("modelId") for pt in template_pres_nodes]
+
+        # Find all connections involving template nodes (EXCEPT presOf)
+        template_connections = []
+        for cxn in cxnLst_elem.findall(qn("dgm:cxn")):
+            src_id = cxn.get("srcId")
+            dest_id = cxn.get("destId")
+            cxn_type = cxn.get("type")
+
+            # Skip presOf connections - they are handled separately
+            if cxn_type == "presOf":
+                continue
+
+            # Check if this connection involves any template nodes
+            if src_id in template_node_ids or dest_id in template_node_ids:
+                template_connections.append((cxn_type, src_id, dest_id, cxn))
+
+        # Create new connections by copying the pattern
+        import uuid
+
+        for cxn_type, src_id, dest_id, template_cxn in template_connections:
+            new_cxn = etree.SubElement(cxnLst_elem, qn("dgm:cxn"))  # pyright: ignore[reportUnknownMemberType]
+            new_cxn.set("modelId", "{" + str(uuid.uuid4()).upper() + "}")
+
+            # Map template node IDs to new node IDs
+            new_src_id = src_id
+            new_dest_id = dest_id
+
+            if src_id in template_node_ids:
+                idx = template_node_ids.index(src_id)
+                new_src_id = pres_ids[idx]
+            if dest_id in template_node_ids:
+                idx = template_node_ids.index(dest_id)
+                new_dest_id = pres_ids[idx]
+
+            # Copy all attributes from template except modelId, srcId, destId
+            for attr_name, attr_value in template_cxn.attrib.items():
+                clean_name = attr_name.split("}")[-1] if "}" in attr_name else attr_name
+                if clean_name not in ("modelId",):
+                    new_cxn.set(clean_name, attr_value)
+
+            # Set the new source and destination
+            new_cxn.set("srcId", new_src_id)
+            new_cxn.set("destId", new_dest_id)
+
+    def _create_presof_connection(self, data_node_id: str, textRect_pres_id: str) -> None:
+        """Create a presOf connection from data node to textRect presentation node.
+
+        This connection is needed for proper text rendering in SmartArt.
+        PowerPoint uses srcOrd="0" destOrd="0" for presOf connections.
+        """
+        import uuid
+
+        cxnLst_elem = self._data_model.find(qn("dgm:cxnLst"))
+        if cxnLst_elem is None:
+            return
+
+        # Find the presId from existing presOf connections
+        pres_id = None
+        for cxn in cxnLst_elem.findall(qn("dgm:cxn")):
+            if cxn.get("type") == "presOf":
+                pres_id = cxn.get("presId")
+                break
+
+        # If no presId found, don't create the connection
+        if not pres_id:
+            return
+
+        # Create presOf connection with srcOrd="0" destOrd="0" (PowerPoint standard)
+        new_cxn = etree.SubElement(cxnLst_elem, qn("dgm:cxn"))  # pyright: ignore[reportUnknownMemberType]
+        new_cxn.set("modelId", "{" + str(uuid.uuid4()).upper() + "}")
+        new_cxn.set("type", "presOf")
+        new_cxn.set("srcId", data_node_id)
+        new_cxn.set("destId", textRect_pres_id)
+        new_cxn.set("srcOrd", "0")
+        new_cxn.set("destOrd", "0")
+        new_cxn.set("presId", pres_id)
+
+    def _find_parent_presentation_node_and_pres_id(
+        self, cxnLst_elem: _Element
+    ) -> tuple[str | None, str | None]:
+        """Find the parent presentation node and presId used by existing connections.
+
+        Looks for a pres node that is the source of presParOf connections to
+        existing compNodes, and extracts the presId attribute from those connections.
+
+        Returns:
+            Tuple of (parent_pres_id, presId) where both can be None if not found
+        """
+        # Find existing compNode IDs from presentation nodes
+        comp_node_ids = set()
+        for pt in self._data_model.pt_lst:
+            if pt.get("type") == "pres":
+                prSet = pt.find(qn("dgm:prSet"))
+                if prSet is not None and prSet.get("presName") == "compNode":
+                    comp_node_ids.add(pt.modelId)
+
+        # Find which pres node is the parent of these compNodes and get presId
+        for cxn in cxnLst_elem.findall(qn("dgm:cxn")):
+            if cxn.get("type") == "presParOf":
+                dest_id = cxn.get("destId")
+                if dest_id in comp_node_ids:
+                    # This is a parent of a compNode
+                    return cxn.get("srcId"), cxn.get("presId")
+
+        return None, None
+
+    def _extract_template_pres_id(self, cxnLst_elem: _Element) -> str | None:
+        """Extract presId from existing template presentation connections.
+
+        Looks for presParOf connections to pictRect elements, which indicate
+        the layout structure used by template nodes. We should match this presId
+        for new nodes to ensure consistency.
+
+        Returns the presId (e.g., "urn:microsoft.com/office/officeart/2005/8/layout/pList1")
+        """
+        # Find presParOf connections that go to pictRect elements
+        # These have the presId we should use for new nodes
+        for cxn in cxnLst_elem.findall(qn("dgm:cxn")):
+            if cxn.get("type") == "presParOf" and cxn.get("destId", "").startswith("pict"):
+                pres_id = cxn.get("presId")
+                if pres_id:
+                    return pres_id
+
+        return None
+
     def remove_node_structure(self, ptLst: CT_PtList, node_id: str) -> None:
         """Remove a node and its associated presentation and transition nodes."""
         self._remove_pres_nodes(node_id, ptLst)
@@ -45,9 +311,12 @@ class SmartArtNodeFactory:
     def _create_data_node(self, ptLst: CT_PtList, node_id: str) -> CT_Pt:
         """Create a data node with property and shape elements."""
         pt = ptLst.add_pt(node_id, "node")
-        prSet = etree.SubElement(pt, qn("dgm:prSet"))  # pyright: ignore[reportUnknownMemberType]
-        prSet.set("phldrT", "[Text]")
-        prSet.set("phldr", "1")
+        # Remove the type attribute - PowerPoint's editable nodes don't have it
+        # delattr(pt, 'type') doesn't work with lxml, so delete from attrib dict
+        if "type" in pt.attrib:
+            del pt.attrib["type"]
+        etree.SubElement(pt, qn("dgm:prSet"))  # pyright: ignore[reportUnknownMemberType]
+        # Don't set phldrT or phldr attributes - PowerPoint leaves prSet empty
         etree.SubElement(pt, qn("dgm:spPr"))  # pyright: ignore[reportUnknownMemberType]
         pt._ensure_text_structure()  # pyright: ignore[reportPrivateUsage]
         return pt
@@ -93,7 +362,8 @@ class SmartArtNodeFactory:
         for pt in list(ptLst.findall(qn("dgm:pt"))):
             pt_type = pt.get("type")
             if pt_type in ("parTrans", "sibTrans"):
-                if cast("CT_Pt", pt).modelId not in trans_ids_in_use:
+                pt_id = cast("CT_Pt", pt).modelId
+                if pt_id not in trans_ids_in_use:
                     ptLst.remove_pt(cast("CT_Pt", pt))
 
 
@@ -113,16 +383,19 @@ class SmartArtConnectionManager:
         sib_trans_id: str,
     ) -> None:
         """Create a connection from parent to new node."""
-        existing_cxns = sum(
-            1
-            for cxn in cxnLst_elem.findall(qn("dgm:cxn"))
-            if cxn.get("srcId") == parent_node.modelId and cxn.get("type") is None
-        )
+        # Collect existing PARENT-CHILD connections from this parent (type='' or None)
+        existing_cxns = []
+        for cxn in cxnLst_elem.findall(qn("dgm:cxn")):
+            if cxn.get("srcId") == parent_node.modelId and cxn.get("type") in (None, ""):
+                existing_cxns.append(cxn)
+
+        # Create new connection with srcOrd = number of existing children
         cxn_elem = etree.SubElement(cxnLst_elem, qn("dgm:cxn"))
         cxn_elem.set("modelId", cxn_id)
+        # Parent-child connections don't have a type attribute (not even empty string)
         cxn_elem.set("srcId", parent_node.modelId)
         cxn_elem.set("destId", node_id)
-        cxn_elem.set("srcOrd", str(existing_cxns))
+        cxn_elem.set("srcOrd", str(len(existing_cxns)))  # New node gets next sequential srcOrd
         cxn_elem.set("destOrd", "0")
         cxn_elem.set("parTransId", par_trans_id)
         cxn_elem.set("sibTransId", sib_trans_id)
@@ -173,6 +446,31 @@ class SmartArtConnectionManager:
             if src_id not in valid_node_ids or dst_id not in valid_node_ids:
                 cxnLst_elem.remove(cxn)
 
+        # Synchronize presOf srcOrd with parent-child srcOrd for data nodes
+        # This ensures visual layout order matches data node order
+        doc_node_id = None
+        for pt in ptLst_elem.findall(qn("dgm:pt")):
+            if pt.get("type") == "doc":
+                doc_node_id = pt.get("modelId")
+                break
+
+        if doc_node_id:
+            # Build a map of data node ID -> parent-child srcOrd
+            data_node_to_srcord = {}
+            for cxn_elem in cxnLst_elem.findall(qn("dgm:cxn")):
+                if cxn_elem.get("type") in (None, "") and cxn_elem.get("srcId") == doc_node_id:
+                    dest_id = cxn_elem.get("destId")
+                    srcOrd = cxn_elem.get("srcOrd")
+                    if dest_id and srcOrd:
+                        data_node_to_srcord[dest_id] = srcOrd
+
+            # Update presOf srcOrd to match parent-child srcOrd
+            for cxn_elem in cxnLst_elem.findall(qn("dgm:cxn")):
+                if cxn_elem.get("type") == "presOf":
+                    src_id = cxn_elem.get("srcId")
+                    if src_id in data_node_to_srcord:
+                        cxn_elem.set("srcOrd", data_node_to_srcord[src_id])
+
 
 class SmartArt(ParentedElementProxy):
     """A SmartArt graphic in a presentation.
@@ -187,6 +485,37 @@ class SmartArt(ParentedElementProxy):
         self._data_model = data_model
         self._node_factory = SmartArtNodeFactory(data_model)
         self._connection_manager = SmartArtConnectionManager(data_model)
+        # Don't automatically fix missing type attributes - the template may not have them
+        # and adding them causes PowerPoint to reject the file as needing repair
+
+    def _fix_missing_type_attributes(self) -> None:
+        """Fix data nodes and connections that are missing type attributes.
+
+        Some template files have data nodes without the type attribute and
+        connections without type="". PowerPoint expects proper types, so we add them.
+        """
+        # Fix data nodes missing type="node"
+        for pt in self._data_model.pt_lst:
+            # Check if this looks like a data node (has text content and no type, or wrong type)
+            type_attr = pt.get("type")
+            if type_attr is None or type_attr not in ("doc", "pres", "parTrans", "sibTrans"):
+                # Check if it has text content (indicates it's a data node)
+                t_elem = pt.find(qn("dgm:t"))
+                if t_elem is not None:
+                    # It's a data node without proper type - fix it
+                    if type_attr is None:
+                        pt.set("type", "node")
+
+        # Fix connections missing type="" for parent-child relationships
+        cxnLst = self._data_model.find(qn("dgm:cxnLst"))
+        if cxnLst is not None:
+            for cxn in cxnLst.findall(qn("dgm:cxn")):
+                # Parent-child connections should have type="" (empty string)
+                # They are identified by not having presOf, presParOf, or other special types
+                type_attr = cxn.get("type")
+                if type_attr is None:
+                    # This is a parent-child connection - should have type=""
+                    cxn.set("type", "")
 
     @property
     def nodes(self) -> SmartArtNodes:
@@ -204,7 +533,12 @@ class SmartArt(ParentedElementProxy):
         """
         return tuple(node for node in self.nodes if node.is_editable)
 
-    def add_node(self, text: str = "", parent: SmartArtNode | str | None = None) -> SmartArtNode:
+    def add_node(
+        self,
+        text: str = "",
+        parent: SmartArtNode | str | None = None,
+        create_image_placeholders: bool = True,
+    ) -> SmartArtNode:
         """Add a new editable node to this SmartArt diagram.
 
         Args:
@@ -213,10 +547,20 @@ class SmartArt(ParentedElementProxy):
                    - None (default): adds as sibling to last editable node
                    - SmartArtNode: adds as child of specified node
                    - "root": explicitly adds as child of document root
+            create_image_placeholders: If True and the SmartArt has image layouts,
+                                      automatically creates presentation nodes
+                                      (compNode, pictRect, textRect) for the new node.
+                                      Default is True.
 
         Returns:
             The newly created SmartArtNode.
         """
+        # IMPORTANT: Capture parent_node BEFORE creating the new node,
+        # because creating the node modifies the node list and affects
+        # the resolution logic for parent=None
+        cxnLst_elem = self._get_or_create_connection_list()
+        parent_node = self._resolve_parent_node(parent, cxnLst_elem)
+
         ptLst = self._get_or_create_pt_list()
         node_id, cxn_id, par_trans_id, sib_trans_id = self._generate_node_ids()
 
@@ -224,19 +568,47 @@ class SmartArt(ParentedElementProxy):
             ptLst, node_id, cxn_id, par_trans_id, sib_trans_id
         )
 
-        cxnLst_elem = self._get_or_create_connection_list()
-        parent_node = self._resolve_parent_node(parent, cxnLst_elem)
-
         if parent_node is not None:
             self._connection_manager.create_connection(
                 cxnLst_elem, parent_node, node_id, cxn_id, par_trans_id, sib_trans_id
             )
+
+        # Auto-create presentation nodes if this is an image layout
+        if create_image_placeholders:
+            self._auto_create_presentation_nodes(ptLst, node_id)
+
+        # Synchronize presOf ordering to ensure consistent state
+        self.synchronize_presof_ordering()
 
         node = SmartArtNode(pt, self)
         if text:
             node.text = text
 
         return node
+
+    def _auto_create_presentation_nodes(self, ptLst: CT_PtList, new_node_id: str) -> None:
+        """Automatically create presentation nodes for the new data node.
+
+        Detects if existing nodes have presentation nodes and if so, creates
+        matching presentation nodes for the new node by copying the structure.
+        """
+        # Check if any existing editable node has presentation nodes
+        template_node_id = None
+        for node in self.editable_nodes:
+            if node._element.modelId != new_node_id:
+                # Check if this node has any presentation nodes
+                for pt in ptLst.findall(qn("dgm:pt")):
+                    if pt.get("type") == "pres":
+                        prSet = pt.find(qn("dgm:prSet"))
+                        if prSet is not None and prSet.get("presAssocID") == node._element.modelId:
+                            template_node_id = node._element.modelId
+                            break
+                if template_node_id:
+                    break
+
+        # If we found a template with presentation nodes, create matching ones
+        if template_node_id:
+            self._node_factory.create_presentation_nodes(ptLst, new_node_id, template_node_id)
 
     def remove_node(self, node: SmartArtNode | int) -> None:
         """Remove a node from this SmartArt diagram.
@@ -266,6 +638,253 @@ class SmartArt(ParentedElementProxy):
 
         self._connection_manager.cleanup_orphaned_connections()
 
+    def embed_image_for_node(self, node: SmartArtNode, image_file: str) -> str:
+        """Embed an image file for a SmartArt node with an image placeholder.
+
+        Args:
+            node: The SmartArtNode with an image placeholder.
+            image_file: Path to the image file or file-like object.
+
+        Returns:
+            The relationship ID (rId) of the embedded image.
+
+        Raises:
+            ValueError: If the node doesn't have an image placeholder.
+        """
+        if not node.has_image_placeholder:
+            raise ValueError(f"Node {node.node_id} doesn't have an image placeholder")
+
+        # Get the presentation package to add the image
+        image_part = self.part.package.get_or_add_image_part(image_file)
+
+        # Create a NEW relationship from the diagram part to the image part
+        # We must create a unique relationship for each node, even if they use the same image
+        # Using _rels._add_relationship directly to bypass get_or_add which would reuse existing
+        from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+
+        rId = self.part._rels._add_relationship(RT.IMAGE, image_part)
+
+        # Find the presentation node with presName="pictRect" or similar
+        # This is the node that should get the blipFill for the image
+        node_id = node.node_id
+
+        # Iterate through all nodes to find pres nodes associated with this data node
+        for pt in self._data_model.pt_lst:
+            if pt.get("type") == "pres":
+                prSet = pt.find(qn("dgm:prSet"))
+                if prSet is not None:
+                    pres_assoc_id = prSet.get("presAssocID")
+                    pres_name = prSet.get("presName", "")
+
+                    # Check if this pres node is associated with our data node
+                    # and has a picture-related presName
+                    if pres_assoc_id == node_id and "pict" in pres_name.lower():
+                        # Add blipFill to this presentation node's spPr
+                        spPr = pt.find(qn("dgm:spPr"))
+                        if spPr is None:
+                            spPr = etree.SubElement(pt, qn("dgm:spPr"))  # pyright: ignore[reportUnknownMemberType]
+
+                        # Clear any existing fill
+                        for child in list(spPr):
+                            spPr.remove(child)
+
+                        # Create blipFill structure
+                        blipFill = etree.SubElement(spPr, qn("a:blipFill"))  # pyright: ignore[reportUnknownMemberType]
+                        blip = etree.SubElement(blipFill, qn("a:blip"))  # pyright: ignore[reportUnknownMemberType]
+                        blip.set(qn("r:embed"), rId)
+                        stretch = etree.SubElement(blipFill, qn("a:stretch"))  # pyright: ignore[reportUnknownMemberType]
+                        etree.SubElement(stretch, qn("a:fillRect"))  # pyright: ignore[reportUnknownMemberType]
+
+        return rId
+
+    def synchronize_presof_ordering(self) -> None:
+        """Synchronize presOf and presParOf connections srcOrd with parent-child srcOrd.
+
+        This ensures that:
+        1. presOf srcOrd (data node → text rect) matches parent-child srcOrd
+        2. presParOf srcOrd (parent pres → child compNode) is sequential 0,1,2,...
+        3. Orphaned presParOf connections are removed
+        4. Unreferenced pres nodes are removed
+        5. Orphaned transition nodes are removed
+
+        This controls the visual layout order in PowerPoint.
+        Call this after adjusting SmartArt nodes if visual order appears incorrect.
+        """
+        ptLst_elem = self._data_model.find(qn("dgm:ptLst"))
+        cxnLst_elem = self._data_model.find(qn("dgm:cxnLst"))
+
+        if ptLst_elem is None or cxnLst_elem is None:
+            return
+
+        # First pass: update presStyleCnt for all presentation nodes
+        self._update_pres_style_cnt(ptLst_elem)
+
+        # Second pass: remove unreferenced nodes that are causing repair issues
+        self._remove_unreferenced_pres_nodes(ptLst_elem, cxnLst_elem)
+
+        # Clean up orphaned transition nodes
+        self._node_factory._remove_transition_nodes(cast("CT_PtList", ptLst_elem))
+        doc_node_id = None
+        for pt in ptLst_elem.findall(qn("dgm:pt")):
+            if pt.get("type") == "doc":
+                doc_node_id = pt.get("modelId")
+                break
+
+        if not doc_node_id:
+            return
+
+        # Build a map of data node ID -> parent-child srcOrd
+        data_node_to_srcord = {}
+        for cxn_elem in cxnLst_elem.findall(qn("dgm:cxn")):
+            if cxn_elem.get("type") in (None, "") and cxn_elem.get("srcId") == doc_node_id:
+                dest_id = cxn_elem.get("destId")
+                srcOrd = cxn_elem.get("srcOrd")
+                if dest_id and srcOrd:
+                    data_node_to_srcord[dest_id] = srcOrd
+
+        # Note: presOf connections should NOT be updated - they always use srcOrd="0" destOrd="0"
+        # PowerPoint maintains these as fixed values, not synchronized with parent-child order
+
+        # Fix presParOf srcOrd to be sequential for correct visual sibling order
+        # Build map of data node -> compNode pres node ID
+        data_to_compnode = {}
+        for pt in ptLst_elem.findall(qn("dgm:pt")):
+            if pt.get("type") == "pres":
+                prSet = pt.find(qn("dgm:prSet"))
+                if prSet is not None and prSet.get("presName") == "compNode":
+                    pres_id = pt.get("modelId")
+                    data_id = prSet.get("presAssocID")
+                    if pres_id and data_id:
+                        data_to_compnode[data_id] = pres_id
+
+        # Find parent pres node (Name0)
+        parent_pres_id = None
+        for pt in ptLst_elem.findall(qn("dgm:pt")):
+            if pt.get("type") == "pres":
+                prSet = pt.find(qn("dgm:prSet"))
+                if prSet is not None and prSet.get("presName") == "Name0":
+                    parent_pres_id = pt.get("modelId")
+                    break
+
+        if parent_pres_id:
+            # Collect presParOf connections from parent to children
+            parent_children_to_remove = []
+            parent_children = []
+
+            for cxn_elem in cxnLst_elem.findall(qn("dgm:cxn")):
+                if cxn_elem.get("type") == "presParOf" and cxn_elem.get("srcId") == parent_pres_id:
+                    dest_id = cxn_elem.get("destId")
+
+                    # Check if dest is a compNode associated with active data
+                    found_active_data = False
+                    for pt in ptLst_elem.findall(qn("dgm:pt")):
+                        if pt.get("modelId") == dest_id:
+                            prSet = pt.find(qn("dgm:prSet"))
+                            if prSet is not None:
+                                # Only process compNodes
+                                if prSet.get("presName") == "compNode":
+                                    data_id = prSet.get("presAssocID")
+                                    # Only keep if it's associated with active data
+                                    if data_id in data_node_to_srcord:
+                                        data_order = int(data_node_to_srcord[data_id])
+                                        parent_children.append((data_order, cxn_elem, data_id))
+                                        found_active_data = True
+                                    else:
+                                        # Orphaned compNode - remove it
+                                        parent_children_to_remove.append(cxn_elem)
+                                else:
+                                    # Not a compNode (e.g., sibTrans) - remove presParOf to it
+                                    parent_children_to_remove.append(cxn_elem)
+                            break
+
+            # Remove all orphaned/invalid presParOf connections
+            for cxn_elem in parent_children_to_remove:
+                cxnLst_elem.remove(cxn_elem)
+
+            # Renumber presParOf srcOrd sequentially based on data node order
+            parent_children.sort(key=lambda x: x[0])
+            for new_ord, (_, cxn_elem, _) in enumerate(parent_children):
+                cxn_elem.set("srcOrd", str(new_ord))
+
+        # Ensure all connections have unique ID attributes
+        self._ensure_connection_ids(cxnLst_elem)
+
+    def _ensure_connection_ids(self, cxnLst_elem) -> None:
+        """Ensure all connections have unique id attributes required by PowerPoint."""
+        # Get the max existing ID number
+        max_id = 0
+        for cxn_elem in cxnLst_elem.findall(qn("dgm:cxn")):
+            cid = cxn_elem.get("id")
+            if cid:
+                try:
+                    cid_num = int(cid)
+                    max_id = max(max_id, cid_num)
+                except (ValueError, TypeError):
+                    pass
+
+        # Assign IDs to connections that don't have them
+        next_id = max_id + 1
+        for cxn_elem in cxnLst_elem.findall(qn("dgm:cxn")):
+            if not cxn_elem.get("id"):
+                cxn_elem.set("id", str(next_id))
+                next_id += 1
+
+    def _remove_unreferenced_pres_nodes(self, ptLst_elem, cxnLst_elem) -> None:
+        """Remove unreferenced pres nodes that are orphaned and cause PowerPoint repair issues."""
+        # Build set of all node IDs referenced in connections (srcId/destId)
+        referenced_ids = set()
+        for cxn_elem in cxnLst_elem.findall(qn("dgm:cxn")):
+            src = cxn_elem.get("srcId")
+            dest = cxn_elem.get("destId")
+            if src:
+                referenced_ids.add(src)
+            if dest:
+                referenced_ids.add(dest)
+
+        # Find and remove unreferenced pres nodes
+        # Note: Do NOT remove transition nodes here - they're referenced via parTransId/sibTransId,
+        # not srcId/destId. They're handled separately by _remove_transition_nodes().
+        nodes_to_remove = []
+        for pt in ptLst_elem.findall(qn("dgm:pt")):
+            mid = pt.get("modelId")
+            ptype = pt.get("type")
+            if mid and mid not in referenced_ids:
+                # Remove unreferenced pres nodes only
+                # Keep: data nodes (doc, node), transition nodes (parTrans, sibTrans)
+                if ptype == "pres":
+                    nodes_to_remove.append(pt)
+
+        # Remove the orphaned nodes
+        for pt in nodes_to_remove:
+            ptLst_elem.remove(pt)
+
+    def _update_pres_style_cnt(self, ptLst_elem) -> None:
+        """Update presStyleCnt for all presentation nodes based on total data node count.
+
+        After adding or removing nodes, all presentation nodes (except special types) should
+        have their presStyleCnt updated to reflect the current total number of data nodes.
+        """
+        # Count editable data nodes
+        data_node_count = 0
+        for pt in ptLst_elem.findall(qn("dgm:pt")):
+            pt_type = pt.get("type")
+            if pt_type not in ("pres", "parTrans", "sibTrans", "doc"):
+                data_node_count += 1
+
+        # Update all presentation nodes
+        for pt in ptLst_elem.findall(qn("dgm:pt")):
+            if pt.get("type") == "pres":
+                prSet = pt.find(qn("dgm:prSet"))
+                if prSet is not None:
+                    pres_name = prSet.get("presName")
+                    # These special presentation nodes keep presStyleCnt="0":
+                    # - compNode: composite node
+                    # - sibTrans, parTrans: transition layout nodes
+                    # - Name0, Name1, etc.: doc/layout nodes
+                    # Only update pictRect and textRect nodes
+                    if pres_name in ("pictRect", "textRect"):
+                        prSet.set("presStyleCnt", str(data_node_count))
+
     def _get_or_create_pt_list(self) -> CT_PtList:
         """Get or create the point list element."""
         ptLst_elem = self._data_model.find(qn("dgm:ptLst"))
@@ -292,19 +911,33 @@ class SmartArt(ParentedElementProxy):
     def _resolve_parent_node(
         self, parent: SmartArtNode | str | None, cxnLst_elem: _Element
     ) -> CT_Pt | None:
-        """Resolve the parent node based on parent parameter."""
+        """Resolve the parent node based on parent parameter.
+
+        Returns the parent node element that the new node should be connected to.
+        When parent is None, finds the parent of the last editable node so the
+        new node becomes a sibling of the last node.
+        """
         if parent == "root":
             return self._data_model.get_doc_node()
         if isinstance(parent, SmartArtNode):
             return parent._element  # pyright: ignore[reportPrivateUsage]
         if parent is None and self.editable_nodes:
-            editable_node_ids = {
-                n._element.modelId
-                for n in self.editable_nodes  # pyright: ignore[reportPrivateUsage]
-            }
-            return self._connection_manager.find_parent_from_connections(
-                cxnLst_elem, editable_node_ids
-            )
+            # Get the last editable node
+            last_node = self.editable_nodes[-1]
+            last_node_id = last_node._element.modelId  # pyright: ignore[reportPrivateUsage]
+
+            # Find the parent of the last node from connections
+            # This makes the new node a sibling of the last node
+            for cxn in cxnLst_elem.findall(qn("dgm:cxn")):
+                dest_id = cxn.get("destId")
+                cxn_type = cxn.get("type")
+                # Look for parent-child connection where last_node is the child
+                if dest_id == last_node_id and (cxn_type is None or cxn_type == ""):
+                    src_id = cxn.get("srcId")
+                    # Find the parent node element
+                    for pt in self._data_model.pt_lst:
+                        if pt.modelId == src_id:
+                            return pt
         return self._data_model.get_doc_node()
 
 
@@ -316,7 +949,7 @@ class SmartArtNode:
 
     def __init__(self, pt_element: CT_Pt, parent: SmartArt):
         self._element = pt_element
-        self._parent = parent
+        self._parent: SmartArt = parent
 
     @property
     def text(self) -> str:
@@ -352,6 +985,122 @@ class SmartArtNode:
         prSet_elem = self._element.find(qn("dgm:prSet"))
         if prSet_elem is not None and "phldr" in prSet_elem.attrib:
             del prSet_elem.attrib["phldr"]
+
+    @property
+    def placeholder_type(self) -> str | None:
+        """The placeholder type of this node, e.g., '[Text]' or '[Image]'.
+
+        Returns None if the node has no placeholder attribute (phldrT).
+        """
+        prSet = self._element.find(qn("dgm:prSet"))
+        if prSet is None:
+            return None
+        return prSet.get("phldrT")
+
+    @property
+    def has_image_placeholder(self) -> bool:
+        """True if this node has an image placeholder.
+
+        Checks both the phldrT attribute ('[Image]') and the presName attribute
+        ('pictRect', 'pict', etc.) which indicate picture/image placeholders.
+        """
+        # Check explicit image placeholder type
+        if self.placeholder_type == "[Image]":
+            return True
+
+        # Check if there's a presentation node with picture-related name
+        # Navigate up to the ptLst, then to dataModel
+        pt_list = self._element.getparent()
+        if pt_list is None:
+            return False
+
+        data_model = pt_list.getparent()
+        if data_model is None:
+            return False
+
+        # Find presentation nodes associated with this data node
+        node_id = self._element.get("modelId")
+
+        # Use pt_lst property to get all nodes
+        all_pts = data_model.pt_lst
+        for pres_node in all_pts:
+            if pres_node.get("type") == "pres":
+                prSet = pres_node.find(qn("dgm:prSet"))
+                if prSet is not None:
+                    # Check if this pres node is associated with our data node
+                    assoc_id = prSet.get("presAssocID")
+                    if assoc_id == node_id:
+                        # Check if it's a picture placeholder
+                        pres_name = prSet.get("presName", "")
+                        if "pict" in pres_name.lower():
+                            return True
+
+        return False
+
+    @property
+    def image_path(self) -> str | None:
+        """Get the image file path for this node's image placeholder.
+
+        Returns None if no image has been set yet.
+
+        Note: This is a simplified implementation that stores the path reference.
+        Full image embedding requires access to the presentation's image parts
+        and the slide's shape tree to create/update the actual picture shape.
+        """
+        prSet = self._element.find(qn("dgm:prSet"))
+        if prSet is None:
+            return None
+        return prSet.get("{http://schemas.python-pptx.org/}imagePath")
+
+    @image_path.setter
+    def image_path(self, value: str | None):
+        """Set image file path for this node's image placeholder.
+
+        Args:
+            value: Path to an image file, or None to clear.
+
+        Raises:
+            ValueError: If this node doesn't have an image placeholder.
+
+        Note: This stores the path and attempts to embed the actual image.
+        The image is added to the presentation's image parts and linked
+        via the SmartArt diagram part relationships.
+        """
+        if not self.has_image_placeholder:
+            raise ValueError(
+                f"This node has placeholder type '{self.placeholder_type}', "
+                "not '[Image]'. Only nodes with image placeholders can have images set."
+            )
+
+        # Don't remove placeholder flag - keep it to preserve text rendering
+        # self._remove_placeholder_flag()
+        prSet = self._element.find(qn("dgm:prSet"))
+        if prSet is None:
+            prSet = etree.SubElement(self._element, qn("dgm:prSet"))  # pyright: ignore
+
+        if value is None:
+            # Clear the image reference
+            if "{http://schemas.python-pptx.org/}imagePath" in prSet.attrib:
+                del prSet.attrib["{http://schemas.python-pptx.org/}imagePath"]
+            # Also clear the blip relationship if it exists
+            if "{http://schemas.python-pptx.org/}blipRId" in prSet.attrib:
+                del prSet.attrib["{http://schemas.python-pptx.org/}blipRId"]
+        else:
+            # Store the path
+            prSet.set("{http://schemas.python-pptx.org/}imagePath", value)
+
+            # Attempt to embed the actual image using parent SmartArt
+            try:
+                self._parent.embed_image_for_node(self, value)
+            except Exception as e:
+                # If embedding fails, at least the path is stored
+                import warnings
+
+                warnings.warn(
+                    f"Failed to embed image '{value}': {e}. "
+                    "Path has been stored but image won't display in PowerPoint.",
+                    UserWarning,
+                )
 
     @property
     def node_id(self) -> str:

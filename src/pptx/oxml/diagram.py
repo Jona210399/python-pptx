@@ -65,8 +65,8 @@ class CT_PtList(BaseOxmlElement):
     def add_pt(self, model_id: str, node_type: str = "node") -> CT_Pt:
         """Add a new `dgm:pt` element with the given modelId and type."""
         pt = cast("CT_Pt", etree.SubElement(self, qn("dgm:pt")))  # pyright: ignore
-        pt.modelId = model_id
-        pt.type = node_type
+        pt.set("modelId", model_id)
+        pt.set("type", node_type)
         return pt
 
     def remove_pt(self, pt: CT_Pt) -> None:
@@ -119,10 +119,23 @@ class CT_Pt(BaseOxmlElement):
     def text_value(self) -> str:
         """Text content of this diagram node.
 
-        Returns the text from the `dgm:t` element, or empty string if not present.
+        Returns the text from the `dgm:t/a:p` paragraph structure, or empty string if not present.
         """
         t_elem = self.find(qn("dgm:t"))
         if t_elem is not None:
+            # First try the proper paragraph structure (dgm:t/a:p/a:r/a:t)
+            p_elem = t_elem.find(qn("a:p"))
+            if p_elem is not None:
+                # Collect text from all runs
+                text_parts = []
+                for r_elem in p_elem.findall(qn("a:r")):
+                    t_child = r_elem.find(qn("a:t"))
+                    if t_child is not None and t_child.text:
+                        text_parts.append(t_child.text)
+                if text_parts:
+                    return "".join(text_parts)
+
+            # Fall back to old simple structure (dgm:v) for backward compatibility
             v_elem = t_elem.find(qn("dgm:v"))
             if v_elem is not None and v_elem.text:
                 return v_elem.text
