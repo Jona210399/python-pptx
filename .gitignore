@@ -11,3 +11,5 @@ _scratch/
 /spec/gen_spec/spec*.db
 tags
 /tests/debug.py
+/.vscode/
+uv.lock
